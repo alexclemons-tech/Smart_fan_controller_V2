@@ -118,7 +118,7 @@ void setup() {
   pinMode(TEMP_PIN, INPUT);
   pinMode(PWM_PIN, OUTPUT);
 
-  analogWriteResolution(PWM_RESOLUTION);
+  analogWriteResolution(PWM_PIN, PWM_RESOLUTION);
   analogWriteFrequency(PWM_PIN, PWM_FREQ);
   analogWrite(PWM_PIN, 0);
 

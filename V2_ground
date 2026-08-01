@@ -1,0 +1,338 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <Preferences.h>
+#include <esp_task_wdt.h>
+
+const char* AP_SSID = "FanControllerV2";
+const int MIC_PIN = 2;
+const int TEMP_PIN = 3;
+const int FAN_MIN_RUN_SPEED = 170; // Change this number in the future to adjust your minimum speed floor
+const int PWM_PIN = 4;
+
+// NEW: Ground cut control pin (transistor/MOSFET gate/driver)
+const int FAN_GND_CUT_PIN = 25;
+const bool FAN_GND_ON = HIGH;   // Ground connected, fan electrically enabled
+const bool FAN_GND_OFF = LOW;   // Ground disconnected, fan hard-off
+
+const int PWM_FREQ = 25000;
+const int PWM_RESOLUTION = 8;
+const int PWM_MAX = 255;
+
+WebServer server(80);
+Preferences pref;
+OneWire oneWire(TEMP_PIN);
+DallasTemperature sensors(&oneWire);
+
+struct FanState {
+  int micLevel;
+  float tempF;
+  int fanDuty;
+  bool autoMode;
+  int manualSpeed;
+  int micRawThreshold;
+  int tempStart; 
+  int tempMax;   
+};
+
+FanState state = {0, 0.0, 0, true, 128, 2000, 70, 105}; 
+
+unsigned long lastSampleMs = 0;
+const unsigned long SAMPLE_INTERVAL_MS = 1000;
+unsigned long lastTimeNoisyMs = 0;
+const unsigned long FAN_DELAY_MS = 5000;
+
+// Kickstart tracking variables
+unsigned long kickstartStartMs = 0;
+bool isKickstarting = false;
+int previousLoopDuty = 0;
+
+String renderPage() {
+  String html;
+  html.reserve(4200);
+  html += F("<!DOCTYPE html><html><head><meta charset='utf-8'>");
+  html += F("<meta name='viewport' content='width=device-width, initial-scale=1'>");
+  html += F("<title>Fan Controller V2</title>");
+  html += F("<style>");
+  html += F("body{font-family:Arial,sans-serif;background:#101418;color:#e8eef2;margin:0;padding:20px;}");
+  html += F(".card{max-width:720px;margin:0 auto;background:#182028;border:1px solid #26303a;border-radius:16px;padding:20px;}");
+  html += F("h1{margin-top:0;font-size:28px;} .row{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:12px 0;border-bottom:1px solid #26303a;}");
+  html += F(".row:last-child{border-bottom:none;} .label{font-weight:bold;} .value{font-variant-numeric:tabular-nums;}");
+  html += F(".btn{background:#007acc;color:#fff;border:none;padding:10px 20px;font-size:16px;border-radius:8px;cursor:pointer;font-weight:bold;}");
+  html += F(".btn-auto{background:#274; color:#dff5e1;} .btn-man{background:#a33; color:#fdd;}");
+  html += F(".slider{width:100%;max-width:200px;margin:0;} .muted{color:#a9b4be;font-size:13px;}");
+  html += F(".num-input{background:#101418;color:#fff;border:1px solid #26303a;padding:8px;border-radius:6px;width:70px;font-size:16px;text-align:center;}");
+  html += F(".btn-save{background:#28a745;padding:8px 14px;font-size:14px;margin-left:6px;}");
+  html += F("</style></head><body><div class='card'>");
+  html += F("<h1>Fan Controller V2</h1>");
+  html += F("<div class='row'><div class='label'>Control Mode</div><div class='value'>");
+  html += F("<button id='modeBtn' class='btn' onclick='toggleMode()'></button></div></div>");
+  html += F("<div class='row'><div class='label'>Manual Fan Speed</div><div class='value'>");
+  html += F("<input type='range' class='slider' id='manualSpeed' min='0' max='255' value='");
+  html += String(state.manualSpeed);
+  html += F("' onchange=\"fetch('/setParam?speed=' + this.value)\">");
+  html += F("</div></div>");
+  html += F("<div class='row'><div class='label'>Set Mic Mute Threshold (0-4095)</div><div class='value'>");
+  html += F("<input type='number' class='num-input' id='micNumInput' value='");
+  html += String(state.micRawThreshold);
+  html += F("'><button class='btn btn-save' onclick='saveThreshold()'>Save</button></div></div>");
+  html += F("<div class='row'><div class='label'>Fan Start Temperature (°F)</div><div class='value'>");
+  html += F("<input type='number' class='num-input' id='tempStartInput' value='");
+  html += String(state.tempStart);
+  html += F("'><button class='btn btn-save' onclick='saveLowTemp()'>Save</button></div></div>");
+  html += F("<div class='row'><div class='label'>Fan 100% Max Temp (°F)</div><div class='value'>");
+  html += F("<input type='number' class='num-input' id='tempMaxInput' value='");
+  html += String(state.tempMax);
+  html += F("'><button class='btn btn-save' onclick='saveHighTemp()'>Save</button></div></div>");
+  html += F("<div class='row'><div class='label'>Live Microphone Reading</div><div class='value' id='liveMic'>-</div></div>");
+  html += F("<div class='row'><div class='label'>Saved Target Threshold</div><div class='value' id='savedThreshold' style='color:#00b0ff;'>-</div></div>");
+  html += F("<div class='row'><div class='label'>Temperature (DS18B20)</div><div class='value' id='liveTemp'>-</div></div>");
+  html += F("<div class='row'><div class='label'>Current Fan Output</div><div class='value' id='liveDuty'>-</div></div>");
+  html += F("<p class='muted'>Adjust limits safely via individual Save updates.</p>");
+  html += F("</div>");
+  html += F("<script>");
+  html += F("function updateDashboard(){");
+  html += F(" fetch('/status').then(res=>res.json()).then(data=>{");
+  html += F(" let tempTxt = data.tempF < -100 ? 'Sensor Error' : data.tempF.toFixed(1) + ' °F';");
+  html += F(" document.getElementById('liveMic').innerText = data.micLevel;");
+  html += F(" document.getElementById('savedThreshold').innerText = data.savedThresh;");
+  html += F(" document.getElementById('liveTemp').innerText = tempTxt;");
+  html += F(" document.getElementById('liveDuty').innerText = data.fanDuty + ' / 255';");
+  html += F(" let btn = document.getElementById('modeBtn');");
+  html += F(" if(data.autoMode){ btn.innerText='AUTO MODE'; btn.className='btn btn-auto'; }");
+  html += F(" else { btn.innerText='MANUAL MODE'; btn.className='btn btn-man'; }");
+  html += F(" });");
+  html += F("}");
+  html += F("function toggleMode(){ fetch('/toggle').then(()=>updateDashboard()); }");
+  html += F("function saveThreshold(){ let val = document.getElementById('micNumInput').value; fetch('/setParam?sens=' + val).then(()=>updateDashboard()); }");
+  html += F("function saveLowTemp(){ let val = document.getElementById('tempStartInput').value; fetch('/setParam?tStart=' + val).then(()=>updateDashboard()); }");
+  html += F("function saveHighTemp(){ let val = document.getElementById('tempMaxInput').value; fetch('/setParam?tMax=' + val).then(()=>updateDashboard()); }");
+  html += F("setInterval(updateDashboard, 1000); updateDashboard();");
+  html += F("</script></body></html>");
+  return html;
+}
+
+int readAveragedAnalog(int pin) {
+  unsigned long startMillis = millis();
+  int signalMax = 0;
+  int signalMin = 4095; // ESP32 Max ADC value
+
+  // Sample the audio wave continuously for 50 milliseconds
+  while (millis() - startMillis < 50) {
+    int sample = analogRead(pin);
+    
+    // Prevent sampling errors from breaking the math
+    if (sample < 4096) {
+      if (sample > signalMax) {
+        signalMax = sample; // Save the highest peak
+      }
+      if (sample < signalMin) {
+        signalMin = sample; // Save the lowest valley
+      }
+    }
+  }
+
+  // Peak-to-Peak Amplitude = Total sound volume height
+  int peakToPeak = signalMax - signalMin; 
+  return peakToPeak;
+}
+
+void updateControlLoop() {
+  state.micLevel = readAveragedAnalog(MIC_PIN);
+  keepAlive();
+  sensors.requestTemperatures();
+  keepAlive();
+  
+  float currentTempF = sensors.getTempFByIndex(0);
+  if (currentTempF > -100.0 && currentTempF < 250.0) {
+    state.tempF = currentTempF;
+  }
+
+  int targetDuty = 0;
+  if (state.autoMode) {
+    bool isNoisy = (state.micLevel > state.micRawThreshold);
+    bool isOverheated = (state.tempF >= state.tempMax);
+
+    if (isNoisy) {
+      lastTimeNoisyMs = millis();
+    }
+    
+    // 1. FIRST RULE: If someone is talking (or it was recently noisy) AND it's NOT dangerously hot, turn the fan off.
+    if (isNoisy && !isOverheated) {
+      targetDuty = 0;
+    } 
+    else if ((millis() - lastTimeNoisyMs < FAN_DELAY_MS) && !isOverheated) {
+      targetDuty = 0;
+    } 
+    // 2. SECOND RULE: If someone is talking but it IS overheated, lock the fan to exactly 170 for heat safety.
+    else if (isOverheated && (isNoisy || (millis() - lastTimeNoisyMs < FAN_DELAY_MS))) {
+      targetDuty = 170; 
+    }
+    // 3. THIRD RULE: If it is totally quiet, let the fan scale naturally all the way up to full blast (255).
+    else {
+      targetDuty = map(constrain((int)state.tempF, state.tempStart, state.tempMax), state.tempStart, state.tempMax, 0, PWM_MAX);
+      
+      // Keep the floor at 170 so it never dips low enough to stall out while scaling up
+      if (targetDuty > 0 && targetDuty < 170) {
+        targetDuty = 170; 
+      }
+    }
+  } else {
+    targetDuty = state.manualSpeed;
+  }
+
+  // --- NON-BLOCKING KICKSTART ENGINE ---
+  
+  // Detect if the fan needs to wake up from an absolute stop
+  if (previousLoopDuty == 0 && targetDuty > 0 && !isKickstarting) {
+    isKickstarting = true;
+    kickstartStartMs = millis();
+  }
+
+  // Manage active kickstart duration
+  if (isKickstarting) {
+    if (millis() - kickstartStartMs < 350) {
+      state.fanDuty = PWM_MAX; // Force 100% duty cycle to get blades rotating
+    } else {
+      isKickstarting = false; // Kickstart window closed
+      state.fanDuty = constrain(targetDuty, 0, PWM_MAX);
+    }
+  } else {
+    state.fanDuty = constrain(targetDuty, 0, PWM_MAX);
+  }
+
+  // Record requested goal duty for tracking changes in next cycle
+  previousLoopDuty = targetDuty;
+
+  // NEW: Hard off via ground cut when duty is 0
+  bool shouldEnableFanGround = (state.fanDuty > 0);
+
+  if (!shouldEnableFanGround) {
+    // Force true electrical off
+    analogWrite(PWM_PIN, 0);
+    digitalWrite(FAN_GND_CUT_PIN, FAN_GND_OFF);
+    isKickstarting = false; // optional cleanup for next restart
+  } else {
+    // Ensure ground path is active before driving PWM
+    digitalWrite(FAN_GND_CUT_PIN, FAN_GND_ON);
+    analogWrite(PWM_PIN, state.fanDuty);
+  }
+}
+
+void keepAlive() {
+  server.handleClient();
+  esp_task_wdt_reset();
+  delay(1);
+}
+
+void handleRoot() {
+  server.send(200, "text/html", renderPage());
+}
+
+void handleToggleMode() {
+  state.autoMode = !state.autoMode;
+  pref.begin("fan_ctrl", false);
+  pref.putBool("auto", state.autoMode);
+  pref.end();
+  server.send(200, "text/plain", "OK");
+}
+
+void handleSetParam() {
+  bool updated = false;
+  pref.begin("fan_ctrl", false);
+  if (server.hasArg("speed")) {
+    state.manualSpeed = server.arg("speed").toInt();
+    pref.putInt("speed", state.manualSpeed);
+    updated = true;
+  }
+  if (server.hasArg("sens")) {
+    state.micRawThreshold = server.arg("sens").toInt();
+    pref.putInt("sens_raw", state.micRawThreshold);
+    updated = true;
+  }
+  if (server.hasArg("tStart")) {
+    state.tempStart = server.arg("tStart").toInt();
+    pref.putInt("tStart_raw", state.tempStart);
+    updated = true;
+  }
+  if (server.hasArg("tMax")) {
+    state.tempMax = server.arg("tMax").toInt();
+    pref.putInt("tMax_raw", state.tempMax);
+    updated = true;
+  }
+  pref.end();
+  server.send(200, "text/plain", "OK");
+
+  // Keep responsive if manually updating slider or thresholds
+  if (!state.autoMode && server.hasArg("speed")) {
+    // Let the central control loop process manual updates so kickstart applies to sliders too
+    updateControlLoop(); 
+  }
+}
+
+void handleStatus() {
+  String json = "{";
+  json += "\"micLevel\":" + String(state.micLevel) + ",";
+  json += "\"savedThresh\":" + String(state.micRawThreshold) + ",";
+  json += "\"tempF\":" + String(state.tempF, 2) + ",";
+  json += "\"fanDuty\":" + String(state.fanDuty) + ",";
+  json += "\"autoMode\":" + String(state.autoMode ? "true" : "false");
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(MIC_PIN, INPUT);
+  pinMode(PWM_PIN, OUTPUT);
+
+  // NEW: initialize ground-cut output in fail-safe OFF
+  pinMode(FAN_GND_CUT_PIN, OUTPUT);
+  digitalWrite(FAN_GND_CUT_PIN, FAN_GND_OFF);
+  delay(50);
+
+  analogWriteResolution(PWM_PIN, PWM_RESOLUTION);
+  analogWriteFrequency(PWM_PIN, PWM_FREQ);
+  analogWrite(PWM_PIN, 0);
+  sensors.begin();
+
+  pref.begin("fan_ctrl", true);
+  state.autoMode = pref.getBool("auto", true);
+  state.manualSpeed = pref.getInt("speed", 128);
+  state.micRawThreshold = pref.getInt("sens_raw", 2000);
+  state.tempStart = pref.getInt("tStart_raw", 70);
+  state.tempMax = pref.getInt("tMax_raw", 105);
+  pref.end();
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID);
+  WiFi.setTxPower(WIFI_POWER_5dBm);
+
+  server.on("/", handleRoot);
+  server.on("/toggle", handleToggleMode);
+  server.on("/setParam", handleSetParam);
+  server.on("/status", handleStatus);
+  server.begin();
+
+  esp_task_wdt_config_t twdt_config = {
+    .timeout_ms = 5000,
+    .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
+    .trigger_panic = true
+  };
+
+  esp_task_wdt_init(&twdt_config);
+  esp_task_wdt_add(NULL);
+}
+
+void loop() {
+  keepAlive();
+  // Continuously run kickstart check if active, or poll normally on sample interval
+  if (isKickstarting || (millis() - lastSampleMs >= SAMPLE_INTERVAL_MS)) {
+    if (!isKickstarting) {
+      lastSampleMs = millis();
+    }
+    updateControlLoop();
+  }
+}
